@@ -5013,3 +5013,303 @@ def test_migrate_fails_when_audit_trigger_dropped_after_migration(tmp_path):
         assert conn.execute(
             "SELECT action FROM name_events ORDER BY id"
         ).fetchall() == [("insert",), ("update",)]
+
+
+# ---------- 写后读一致性：响应固定为写事务提交时的记录（双连接确定性交错） ----------
+
+
+class CommitHookConnection:
+    """代理连接：commit 成功后触发一次性回调。
+
+    用于确定性复现“写事务已提交、响应尚未返回”的交错窗口：回调在另一个
+    连接上执行并发写（改名 / 释放 / 合并）。sqlite3.Connection 为内置
+    不可变类型、实例属性只读，故与 CountingConnection 一样用代理包装
+    单个真实连接（service 只通过传入的 conn 访问数据库）。
+    """
+
+    def __init__(self, inner, hook):
+        self._inner = inner
+        self._hook = hook
+
+    def commit(self):
+        self._inner.commit()
+        hook, self._hook = self._hook, None
+        if hook is not None:
+            hook()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def hooked_connection(hook):
+    """包装一个新连接：首次 commit 提交成功后在另一连接上执行 hook。"""
+    return CommitHookConnection(database.get_connection(), hook)
+
+
+def rename_via_second_connection(namespace, normalized_name, new_name):
+    """另一连接按规范名定位记录并改名（模拟提交后紧随的并发请求）。"""
+    other = database.get_connection()
+    try:
+        row = other.execute(
+            "SELECT id, revision FROM display_names "
+            "WHERE namespace = ? AND normalized_name = ?",
+            (namespace, normalized_name),
+        ).fetchone()
+        assert row is not None
+        service.rename_name(other, namespace, row["id"], new_name, row["revision"])
+    finally:
+        other.close()
+
+
+def release_via_second_connection(namespace, normalized_name):
+    """另一连接按规范名定位记录并释放（删除名称并写入冷却）。"""
+    other = database.get_connection()
+    try:
+        row = other.execute(
+            "SELECT id, revision FROM display_names "
+            "WHERE namespace = ? AND normalized_name = ?",
+            (namespace, normalized_name),
+        ).fetchone()
+        assert row is not None
+        service.release_name(other, namespace, row["id"], row["revision"], 60)
+    finally:
+        other.close()
+
+
+def merge_via_second_connection(source, target):
+    """另一连接把 source 命名空间整体合并到 target。"""
+    other = database.get_connection()
+    try:
+        service.merge_namespaces(other, source, target)
+    finally:
+        other.close()
+
+
+def list_names_fresh(namespace):
+    """新连接上读取命名空间当前已注册名称（验证交错写入确实生效）。"""
+    conn = database.get_connection()
+    try:
+        return service.list_names(conn, namespace)
+    finally:
+        conn.close()
+
+
+def test_register_response_pinned_when_renamed_right_after_commit(client):
+    """注册提交后另一连接立即改名：响应仍是本次注册写入的名称与版本。"""
+    conn = hooked_connection(
+        lambda: rename_via_second_connection("chat", "alice", "Racer")
+    )
+    try:
+        record = service.register_name(conn, "chat", "Alice", "alice")
+    finally:
+        conn.close()
+
+    # 响应固定为本次写事务提交时的记录：名称 / 版本不受后续改名影响
+    assert record["namespace"] == "chat"
+    assert record["original_name"] == "Alice"
+    assert record["normalized_name"] == "alice"
+    assert record["revision"] == 1
+
+    # 交错真实发生：另一连接的改名已生效
+    (current,) = list_names_fresh("chat")
+    assert current["original_name"] == "Racer"
+    assert current["revision"] == 2
+
+
+def test_register_response_pinned_when_merged_right_after_commit(client):
+    """注册提交后另一连接立即把所在空间合并走：响应命名空间与名称不变。"""
+    conn = hooked_connection(lambda: merge_via_second_connection("a", "b"))
+    try:
+        record = service.register_name(conn, "a", "Alice", "alice")
+    finally:
+        conn.close()
+
+    # 响应固定为提交时的记录：命名空间仍为源空间
+    assert record["namespace"] == "a"
+    assert record["original_name"] == "Alice"
+    assert record["revision"] == 1
+
+    # 合并确实生效：记录已迁入目标空间
+    assert list_names_fresh("a") == []
+    (moved,) = list_names_fresh("b")
+    assert moved["id"] == record["id"]
+    assert moved["original_name"] == "Alice"
+
+
+def test_insert_batch_response_pinned_when_released_right_after_commit(client):
+    """批量注册提交后另一连接立即释放其中一条：响应仍是全部记录、请求顺序。"""
+    conn = hooked_connection(lambda: release_via_second_connection("chat", "bob"))
+    try:
+        records = service.insert_batch(conn, "chat", ["alice", "bob", "carol"])
+    finally:
+        conn.close()
+
+    # 记录数量、名称、版本与请求顺序都不受后续释放影响
+    assert [r["original_name"] for r in records] == ["alice", "bob", "carol"]
+    assert [r["normalized_name"] for r in records] == ["alice", "bob", "carol"]
+    assert [r["revision"] for r in records] == [1, 1, 1]
+    assert all(r["namespace"] == "chat" for r in records)
+
+    # 释放确实生效：库内只剩 alice 与 carol
+    remaining = [r["original_name"] for r in list_names_fresh("chat")]
+    assert remaining == ["alice", "carol"]
+
+
+def test_claim_response_pinned_when_renamed_right_after_commit(client):
+    """预占确认提交后另一连接立即改名：响应保留确认时的名称、token 与消费时间。"""
+    setup = database.get_connection()
+    try:
+        reservation = service.create_reservation(setup, "chat", "Alice", 120)
+    finally:
+        setup.close()
+
+    conn = hooked_connection(
+        lambda: rename_via_second_connection("chat", "alice", "Racer")
+    )
+    try:
+        record = service.claim_reservation(conn, "chat", reservation["token"])
+    finally:
+        conn.close()
+
+    # 响应固定为确认提交时的记录，token 与消费时间完整保留
+    assert record["original_name"] == "Alice"
+    assert record["normalized_name"] == "alice"
+    assert record["revision"] == 1
+    assert record["token"] == reservation["token"]
+    assert record["expires_at"] == reservation["expires_at"]
+    assert record["consumed_at"] is not None
+
+    # 改名确实生效
+    (current,) = list_names_fresh("chat")
+    assert current["original_name"] == "Racer"
+    assert current["revision"] == 2
+
+
+def test_rename_response_pinned_when_renamed_again_right_after_commit(client):
+    """改名提交后另一连接立即再次改名：响应仍是本次改名的名称与版本。"""
+    setup = database.get_connection()
+    try:
+        original = service.register_name(setup, "chat", "Alice", "alice")
+    finally:
+        setup.close()
+
+    conn = hooked_connection(
+        lambda: rename_via_second_connection("chat", "alice-2", "Racer")
+    )
+    try:
+        record = service.rename_name(conn, "chat", original["id"], "Alice-2", 1)
+    finally:
+        conn.close()
+
+    # 响应固定为本次改名（revision 1 -> 2）的结果
+    assert record["original_name"] == "Alice-2"
+    assert record["normalized_name"] == "alice-2"
+    assert record["revision"] == 2
+
+    # 另一连接的再次改名确实生效（revision 3）
+    (current,) = list_names_fresh("chat")
+    assert current["original_name"] == "Racer"
+    assert current["revision"] == 3
+
+
+def test_swap_response_pinned_when_renamed_right_after_commit(client):
+    """交换提交后另一连接立即改名：响应仍是交换完成时的成对名称与版本。"""
+    setup = database.get_connection()
+    try:
+        alice = service.register_name(setup, "chat", "Alice", "alice")
+        bob = service.register_name(setup, "chat", "Bob", "bob")
+    finally:
+        setup.close()
+
+    # 交换后 alice 记录持有规范名 "bob"：另一连接立即把它改成 Racer
+    conn = hooked_connection(
+        lambda: rename_via_second_connection("chat", "bob", "Racer")
+    )
+    try:
+        records = service.swap_names(
+            conn, "chat", [(alice["id"], 1), (bob["id"], 1)]
+        )
+    finally:
+        conn.close()
+
+    # 响应固定为交换提交时的状态：按请求顺序成对互换、双方 revision 各 + 1
+    assert [r["id"] for r in records] == [alice["id"], bob["id"]]
+    by_id = {r["id"]: r for r in records}
+    assert by_id[alice["id"]]["original_name"] == "Bob"
+    assert by_id[alice["id"]]["normalized_name"] == "bob"
+    assert by_id[alice["id"]]["revision"] == 2
+    assert by_id[bob["id"]]["original_name"] == "Alice"
+    assert by_id[bob["id"]]["normalized_name"] == "alice"
+    assert by_id[bob["id"]]["revision"] == 2
+
+    # 另一连接的改名确实生效
+    current = {r["id"]: r for r in list_names_fresh("chat")}
+    assert current[alice["id"]]["original_name"] == "Racer"
+    assert current[alice["id"]]["revision"] == 3
+    assert current[bob["id"]]["original_name"] == "Alice"
+    assert current[bob["id"]]["revision"] == 2
+
+
+def test_swap_response_pinned_when_released_right_after_commit(client):
+    """交换提交后另一连接立即释放其中一条：响应仍包含两条完整记录。"""
+    setup = database.get_connection()
+    try:
+        alice = service.register_name(setup, "chat", "Alice", "alice")
+        bob = service.register_name(setup, "chat", "Bob", "bob")
+    finally:
+        setup.close()
+
+    # 交换后 bob 记录持有规范名 "alice"：另一连接立即释放该记录
+    conn = hooked_connection(lambda: release_via_second_connection("chat", "alice"))
+    try:
+        records = service.swap_names(
+            conn, "chat", [(alice["id"], 1), (bob["id"], 1)]
+        )
+    finally:
+        conn.close()
+
+    # 记录数量与内容不受后续释放影响
+    assert len(records) == 2
+    by_id = {r["id"]: r for r in records}
+    assert by_id[alice["id"]]["original_name"] == "Bob"
+    assert by_id[alice["id"]]["revision"] == 2
+    assert by_id[bob["id"]]["original_name"] == "Alice"
+    assert by_id[bob["id"]]["revision"] == 2
+
+    # 释放确实生效：库内只剩 alice 记录（现名 Bob）
+    remaining = list_names_fresh("chat")
+    assert [r["id"] for r in remaining] == [alice["id"]]
+
+
+def test_allocate_response_pinned_when_renamed_right_after_commit(client):
+    """分配提交后另一连接立即改名：响应保留 client_id、候选序号与分配到的名称。"""
+    # 首选 "shared" 只能分给第一项，第二项回退到次选 "alt-b"
+    conn = hooked_connection(
+        lambda: rename_via_second_connection("chat", "shared", "Racer")
+    )
+    try:
+        result = service.allocate_names(
+            conn,
+            "chat",
+            [
+                {"client_id": "tenant-a", "candidates": ["shared", "alt-a"]},
+                {"client_id": "tenant-b", "candidates": ["shared", "alt-b"]},
+            ],
+        )
+    finally:
+        conn.close()
+
+    # 响应固定为分配提交时的记录：client_id / 候选序号 / 名称 / 版本齐全
+    assert result["namespace"] == "chat"
+    items = result["items"]
+    assert [(i["client_id"], i["candidate_index"]) for i in items] == [
+        ("tenant-a", 0),
+        ("tenant-b", 1),
+    ]
+    assert [i["original_name"] for i in items] == ["shared", "alt-b"]
+    assert [i["revision"] for i in items] == [1, 1]
+    assert all(i["namespace"] == "chat" for i in items)
+
+    # 改名确实生效
+    current = sorted(r["original_name"] for r in list_names_fresh("chat"))
+    assert current == ["Racer", "alt-b"]
