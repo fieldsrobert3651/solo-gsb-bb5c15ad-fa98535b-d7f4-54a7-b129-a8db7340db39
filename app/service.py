@@ -151,6 +151,22 @@ POST /namespaces/{namespace}/names/allocate）：
    limit 1–100；namespace 过滤匹配变更前**或**变更后的命名空间（合并
    迁出 / 迁入两侧都可见）；多取一条探测是否还有后续，据此给出
    next_cursor（本页最后一条事件号）或 None
+
+写事务成功响应的快照固定（全部写入口一致）：
+1. 单条注册、批量注册、预占（create_reservation）、预占确认（claim）、
+   改名、交换、释放、命名空间合并、策略 PUT 与候选分配的成功响应数据一律
+   在**同一写事务内、COMMIT 之前**读取并组装成普通 dict 快照，COMMIT 成功
+   后才原样返回；绝不在提交之后重新查库生成响应
+2. 因此提交成功后即使另一请求立刻改名、确认预占、释放删除或把记录整体
+   合并到其他命名空间，本次成功响应中的名称（original_name /
+   normalized_name）、命名空间、revision 与记录数量都保持为本次写事务
+   完成时的值，不会混入新名称 / 新版本，也不会缺项或缺数量。多记录响应
+   （批量 / 交换 / 候选分配）始终按请求顺序组装：批量与候选分配按请求项
+   顺序（不依赖 id 排序），交换按 records 的请求顺序；候选分配的每项保留
+   client_id 与命中的候选序号，预占确认保留 token 与 consumed_at
+3. COMMIT 本身失败（SQLITE_BUSY 等）仍按原有错误处理：整事务（业务写入
+   与审计触发器事件）一起回滚，向上抛出对应的冲突类异常，绝不返回成功，
+   也绝不为了补齐响应而在回滚后重复写入
 """
 from __future__ import annotations
 
@@ -552,6 +568,9 @@ def put_script_policy(
                 raise StalePolicyRevisionError(
                     refreshed["revision"] if refreshed else 0
                 )
+        # 响应快照在事务内取定：提交后策略可能立刻被其他连接更新（revision
+        # 递增），提交后再查会把新版本混进本次 PUT 的成功响应
+        policy = get_script_policy_or_404(conn, namespace)
         conn.commit()
     except (StalePolicyRevisionError, ScriptPolicyConflictError):
         conn.rollback()
@@ -568,7 +587,7 @@ def put_script_policy(
             raise StalePolicyRevisionError(refreshed["revision"]) from exc
         raise ScriptPolicyConflictError([]) from exc
 
-    return get_script_policy_or_404(conn, namespace)
+    return policy
 
 
 def _conflict_entry(row, source: str, reason: str) -> dict:
@@ -856,6 +875,13 @@ def register_name(
             (namespace, name, normalized_name),
         )
         new_id = cursor.lastrowid
+        # 响应快照必须在事务内、提交前取定：提交后其他连接可能立刻改名 / 释放
+        # 本条记录，提交后再查会把新名称 / 版本甚至“查无此行”混进成功响应
+        record = dict(
+            conn.execute(
+                "SELECT * FROM display_names WHERE id = ?", (new_id,)
+            ).fetchone()
+        )
         conn.commit()
     except (NameConflictError, MixedScriptNameError):
         conn.rollback()
@@ -865,10 +891,7 @@ def register_name(
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    row = conn.execute(
-        "SELECT * FROM display_names WHERE id = ?", (new_id,)
-    ).fetchone()
-    return dict(row)
+    return record
 
 
 def rename_name(
@@ -945,6 +968,13 @@ def rename_name(
                 (name_id, namespace),
             ).fetchone()
             raise StaleRevisionError(refreshed["revision"] if refreshed else current_revision)
+        # 响应快照在事务内取定：提交后本条记录可能立刻被其他请求改名 / 释放，
+        # 提交后再查会混入新名称 / 版本或缺项，成功响应只承诺提交完成时的记录
+        updated = dict(
+            conn.execute(
+                "SELECT * FROM display_names WHERE id = ?", (name_id,)
+            ).fetchone()
+        )
         conn.commit()
     except (
         NameNotFoundError,
@@ -959,10 +989,7 @@ def rename_name(
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    updated = conn.execute(
-        "SELECT * FROM display_names WHERE id = ?", (name_id,)
-    ).fetchone()
-    return dict(updated)
+    return updated
 
 
 def swap_names(
@@ -1104,6 +1131,14 @@ def swap_names(
         _update(left_id, left_expected, temp_original, temp_norm, bump_revision=False)
         _update(right_id, right_expected, left_name, left_norm, bump_revision=True)
         _update(left_id, left_expected, right_name, right_norm, bump_revision=True)
+        # 响应快照在事务内取定（仍按请求顺序）：提交后双方记录可能立刻被其他
+        # 请求改名 / 释放 / 合并，成功响应只承诺提交完成时的两条记录
+        swapped_rows = conn.execute(
+            "SELECT * FROM display_names WHERE id IN (?, ?)",
+            (left_id, right_id),
+        ).fetchall()
+        by_id = {row["id"]: dict(row) for row in swapped_rows}
+        swapped = [by_id[rid] for rid, _ in entries]
         conn.commit()
     except (SwapRecordNotFoundError, SwapStaleRevisionError, NameConflictError):
         conn.rollback()
@@ -1114,13 +1149,7 @@ def swap_names(
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    placeholders = ", ".join("?" for _ in entries)
-    updated_rows = conn.execute(
-        f"SELECT * FROM display_names WHERE id IN ({placeholders})",
-        [rid for rid, _ in entries],
-    ).fetchall()
-    by_id = {row["id"]: dict(row) for row in updated_rows}
-    return [by_id[rid] for rid, _ in entries]
+    return swapped
 
 
 def insert_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> list[dict]:
@@ -1169,6 +1198,16 @@ def insert_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> 
                 (namespace, name, normalized_name),
             )
             ids.append(cursor.lastrowid)
+        # 响应快照在事务内取定：提交后本批记录可能立刻被其他请求改名 / 释放 /
+        # 合并，提交后再查会混入新名称 / 版本、缺项或数量不符。多记录响应按
+        # 请求顺序（ids 顺序）组装，不依赖 id 排序恰好与请求顺序一致
+        placeholders = ", ".join("?" for _ in ids)
+        inserted_rows = conn.execute(
+            f"SELECT * FROM display_names WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        rows_by_id = {row["id"]: dict(row) for row in inserted_rows}
+        records = [rows_by_id[new_id] for new_id in ids]
         conn.commit()
     except (NameConflictError, BatchMixedScriptError):
         conn.rollback()
@@ -1178,12 +1217,7 @@ def insert_batch(conn: sqlite3.Connection, namespace: str, names: list[str]) -> 
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    placeholders = ", ".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT * FROM display_names WHERE id IN ({placeholders}) ORDER BY id",
-        ids,
-    ).fetchall()
-    return [dict(row) for row in rows]
+    return records
 
 
 def create_reservation(
@@ -1222,6 +1256,13 @@ def create_reservation(
             (namespace, name, normalized_name, token, expires_at),
         )
         new_id = cursor.lastrowid
+        # 响应快照在事务内取定：提交后该预占可能被其他连接立刻确认 / 合并，
+        # 提交后再查会混入新状态甚至缺项，成功响应只承诺提交完成时的记录
+        record = dict(
+            conn.execute(
+                "SELECT * FROM name_reservations WHERE id = ?", (new_id,)
+            ).fetchone()
+        )
         conn.commit()
     except (NameConflictError, MixedScriptNameError):
         conn.rollback()
@@ -1231,10 +1272,6 @@ def create_reservation(
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    row = conn.execute(
-        "SELECT * FROM name_reservations WHERE id = ?", (new_id,)
-    ).fetchone()
-    record = dict(row)
     record["ttl_seconds"] = ttl_seconds
     return record
 
@@ -1305,6 +1342,16 @@ def claim_reservation(conn: sqlite3.Connection, namespace: str, token: str) -> d
         # 条件更新兜底：若影响行数为 0，说明并发确认抢先，整体回滚
         if mark_cursor.rowcount == 0:
             raise ReservationConsumedError(token)
+        # 响应快照（含 token / expires_at / consumed_at）在事务内取定：提交后
+        # 新注册记录可能立刻被改名 / 释放 / 合并，预占也可能被其他请求观察到
+        # 后续状态，成功响应只承诺本次写事务完成时的完整记录
+        name_row = conn.execute(
+            "SELECT * FROM display_names WHERE id = ?", (name_id,)
+        ).fetchone()
+        record = dict(name_row)
+        record["token"] = token
+        record["expires_at"] = row["expires_at"]
+        record["consumed_at"] = consumed_at
         conn.commit()
     except (ReservationNotFoundError, ReservationConsumedError, NameConflictError):
         # 只读校验失败 / 冲突：回滚无副作用
@@ -1318,13 +1365,6 @@ def claim_reservation(conn: sqlite3.Connection, namespace: str, token: str) -> d
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    name_row = conn.execute(
-        "SELECT * FROM display_names WHERE id = ?", (name_id,)
-    ).fetchone()
-    record = dict(name_row)
-    record["token"] = token
-    record["expires_at"] = row["expires_at"]
-    record["consumed_at"] = consumed_at
     return record
 
 
@@ -1607,6 +1647,13 @@ def release_name(
             ),
         )
         new_id = cursor.lastrowid
+        # 响应快照在事务内取定：提交后冷却记录可能立刻到期被惰性清理或随命名
+        # 空间合并迁走，提交后再查可能缺项，成功响应只承诺提交完成时的记录
+        record = dict(
+            conn.execute(
+                "SELECT * FROM name_cooldowns WHERE id = ?", (new_id,)
+            ).fetchone()
+        )
         conn.commit()
     except (NameNotFoundError, StaleRevisionError):
         conn.rollback()
@@ -1616,10 +1663,7 @@ def release_name(
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    record = conn.execute(
-        "SELECT * FROM name_cooldowns WHERE id = ?", (new_id,)
-    ).fetchone()
-    return dict(record)
+    return record
 
 
 def list_cooldowns(conn: sqlite3.Connection, namespace: str) -> list[dict]:
@@ -2439,6 +2483,28 @@ def allocate_names(
                 (namespace, entry["original_name"], entry["normalized_name"]),
             )
             inserted.append(cursor.lastrowid)
+        # 响应快照在事务内取定：提交后这些记录可能立刻被其他请求改名 / 释放 /
+        # 合并，提交后再查会混入新名称 / 版本或缺项、数量不符。响应按请求顺序
+        # 组装并保留每项 client_id 与命中的候选序号
+        placeholders = ", ".join("?" for _ in inserted)
+        allocated_rows = conn.execute(
+            f"SELECT * FROM display_names WHERE id IN ({placeholders})",
+            inserted,
+        ).fetchall()
+        records_by_id = {row["id"]: dict(row) for row in allocated_rows}
+        payload = {
+            "namespace": namespace,
+            "states_explored": states_explored,
+            "items": [
+                {
+                    "index": i,
+                    "client_id": items[i]["client_id"],
+                    "candidate_index": candidate_index,
+                    **records_by_id[inserted[i]],
+                }
+                for i, candidate_index in enumerate(solution)
+            ],
+        }
         conn.commit()
     except (AllocationImpossibleError, AllocationSearchTooLargeError):
         conn.rollback()
@@ -2448,25 +2514,7 @@ def allocate_names(
         conn.rollback()
         raise NameConflictError(str(exc)) from exc
 
-    placeholders = ", ".join("?" for _ in inserted)
-    rows = conn.execute(
-        f"SELECT * FROM display_names WHERE id IN ({placeholders}) ORDER BY id",
-        inserted,
-    ).fetchall()
-    records = {row["id"]: dict(row) for row in rows}
-    return {
-        "namespace": namespace,
-        "states_explored": states_explored,
-        "items": [
-            {
-                "index": i,
-                "client_id": items[i]["client_id"],
-                "candidate_index": candidate_index,
-                **records[inserted[i]],
-            }
-            for i, candidate_index in enumerate(solution)
-        ],
-    }
+    return payload
 
 
 # ---------- 显示名变更流水（GET /name-events） ----------

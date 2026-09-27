@@ -1,6 +1,9 @@
 """端到端 API 测试：每个用例使用独立的临时 SQLite 数据库。"""
 import hashlib
 import json
+import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -5013,3 +5016,401 @@ def test_migrate_fails_when_audit_trigger_dropped_after_migration(tmp_path):
         assert conn.execute(
             "SELECT action FROM name_events ORDER BY id"
         ).fetchall() == [("insert",), ("update",)]
+
+
+# ---------- 提交后竞态：成功响应必须固定为写事务完成时的记录 ----------
+#
+# 旧实现的各写入口在 COMMIT 成功之后才重新查库组装成功响应；提交与重查之间
+# 存在窗口，另一连接可能立刻改名 / 释放 / 确认 / 合并，使响应混入新名称与
+# 版本，甚至缺项 / 报错。下列用例用三个连接确定性地复现该交错（不依赖时序）：
+#
+#   1. reader 连接开启只读事务（BEGIN + SELECT），持有库共享锁；
+#   2. 主连接的 COMMIT 在后台线程执行，因共享锁阻塞（busy_timeout 内等待）；
+#   3. reader 回滚只读事务，主连接 COMMIT 随即完成；
+#   4. racer 连接立刻在主连接从 commit() 返回前的同一窗口内改名 / 释放 /
+#      确认 / 合并。
+#
+# 正确实现：响应数据在事务内、COMMIT 之前已取定为普通 dict，racer 的后续
+# 变更不得改变响应中的名称 / 命名空间 / revision / 记录数量。
+
+
+class _GatedCommitConnection:
+    """代理 sqlite3 连接，仅拦截 commit() 以确定性地制造“提交后立即写入”的交错。
+
+    每次 commit() 的时序严格为：
+      1. reader 连接开启只读事务（BEGIN + SELECT），持有库共享锁；
+      2. 真实 COMMIT 放到后台线程执行——它必然阻塞在 reader 的共享锁上
+         （busy_timeout 10s，远长于测试的同步开销）；
+      3. 短暂等待提交线程启动后断言其仍存活（即已被共享锁挡住）；
+      4. reader 回滚释放共享锁，后台 COMMIT 随即完成，线程结束；
+      5. 在主连接从 commit() 返回之前，立即用 racer 连接执行 racer_action。
+
+    因此 racer_action 确定性地落在“COMMIT 已完成、写入口恢复执行”的窗口内，
+    正好命中旧实现“提交后重新查库生成响应”的竞态。
+    """
+
+    def __init__(self, real, reader, racer, racer_action):
+        self._real = real
+        self._reader = reader
+        self._racer = racer
+        self._racer_action = racer_action
+
+    def commit(self):
+        errors: list[BaseException] = []
+
+        def _do_commit():
+            try:
+                self._real.commit()
+            except BaseException as exc:  # noqa: BLE001 - 回送提交线程异常
+                errors.append(exc)
+
+        self._reader.execute("BEGIN")
+        self._reader.execute("SELECT count(*) FROM display_names").fetchone()
+        thread = threading.Thread(target=_do_commit)
+        thread.start()
+        # 先让出足够时间让提交线程实际进入 COMMIT 并阻塞在共享锁上，再做存活
+        # 断言（阻塞本身由锁机制确定性保证；这里只同步线程启动）
+        time.sleep(0.15)
+        assert thread.is_alive(), "COMMIT 应被 reader 的共享锁阻塞"
+        self._reader.execute("ROLLBACK")  # 释放共享锁，COMMIT 随即完成
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "COMMIT 线程未在预期时间内结束"
+        if errors:
+            raise errors[0]
+        # 真实提交已完成、调用方尚未拿到控制权：立即执行并发写入
+        self._racer_action(self._racer)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _blocking_commit_window(db_path, racer_action):
+    """构造 (hook_conn, racer_conn, reader_conn)。
+
+    hook_conn 上写入口的每次 commit 都先被 reader 的只读事务挡住，确认阻塞后
+    再放行，并在提交完成的同一窗口执行 racer_action(racer_conn)。
+    """
+    reader = sqlite3.connect(db_path, isolation_level=None)
+    racer = database.get_connection()
+    # check_same_thread=False：真实 COMMIT 在后台线程执行以制造交错
+    real = sqlite3.connect(
+        db_path, timeout=10, isolation_level=None, check_same_thread=False
+    )
+    real.row_factory = sqlite3.Row
+    real.execute("PRAGMA busy_timeout = 10000")
+    return _GatedCommitConnection(real, reader, racer, racer_action), racer, reader
+
+
+def test_register_response_is_frozen_when_renamed_immediately_after_commit(client):
+    """单条注册：COMMIT 后另一连接立即改名，响应仍是提交时的名称与 revision。"""
+    db_path = database.DATABASE_PATH
+
+    def racer_action(racer):
+        rid = racer.execute(
+            "SELECT id FROM display_names WHERE normalized_name = ?",
+            ("frozen",),
+        ).fetchone()[0]
+        service.rename_name(racer, "chat", rid, "hijacked", 1)
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        record = service.register_name(conn, "chat", "Frozen", "frozen")
+        # 响应固定为本次写事务完成时的记录
+        assert record["namespace"] == "chat"
+        assert record["original_name"] == "Frozen"
+        assert record["normalized_name"] == "frozen"
+        assert record["revision"] == 1
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    # racer 的改名确实落库（证明交错发生过），但没有污染成功响应
+    rows = client.get("/namespaces/chat/names").json()
+    assert [(r["original_name"], r["revision"]) for r in rows] == [("hijacked", 2)]
+
+
+def test_batch_response_is_frozen_when_merged_immediately_after_commit(client):
+    """批量注册：COMMIT 后整批记录立即被合并到另一空间，响应仍保留原空间、
+    原顺序与数量。"""
+    db_path = database.DATABASE_PATH
+
+    def racer_action(racer):
+        service.merge_namespaces(racer, "chat", "archive")
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        records = service.insert_batch(conn, "chat", ["B-one", "B-two", "B-three"])
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    # 多记录响应保持请求顺序（不是按 id 排序的巧合）、原命名空间与数量
+    assert len(records) == 3
+    assert [r["namespace"] for r in records] == ["chat", "chat", "chat"]
+    assert [r["original_name"] for r in records] == ["B-one", "B-two", "B-three"]
+    assert [r["normalized_name"] for r in records] == ["b-one", "b-two", "b-three"]
+    assert all(r["revision"] == 1 for r in records)
+    assert client.get("/namespaces/chat/names").json() == []
+    archived = client.get("/namespaces/archive/names").json()
+    assert [r["original_name"] for r in archived] == ["B-one", "B-two", "B-three"]
+
+
+def test_claim_response_keeps_token_and_consumed_time_under_immediate_rename(client):
+    """预占确认：COMMIT 后注册记录立即被改名，响应保留提交时名称 / 版本以及
+    token / expires_at / consumed_at。"""
+    db_path = database.DATABASE_PATH
+    setup = database.get_connection()
+    try:
+        reservation = service.create_reservation(setup, "chat", "Claimed", 120)
+        token = reservation["token"]
+        expires_at = reservation["expires_at"]
+    finally:
+        setup.close()
+
+    def racer_action(racer):
+        rid = racer.execute(
+            "SELECT id FROM display_names WHERE normalized_name = ?",
+            ("claimed",),
+        ).fetchone()[0]
+        service.rename_name(racer, "chat", rid, "stolen", 1)
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        record = service.claim_reservation(conn, "chat", token)
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert record["original_name"] == "Claimed"
+    assert record["normalized_name"] == "claimed"
+    assert record["namespace"] == "chat"
+    assert record["revision"] == 1
+    # token 与消费时间随响应固定
+    assert record["token"] == token
+    assert record["expires_at"] == expires_at
+    assert isinstance(record["consumed_at"], str) and record["consumed_at"].endswith("Z")
+
+    rows = client.get("/namespaces/chat/names").json()
+    assert [(r["original_name"], r["revision"]) for r in rows] == [("stolen", 2)]
+
+
+def test_rename_response_is_frozen_when_renamed_again_immediately(client):
+    """改名：COMMIT 后另一连接立即再次改名，响应固定为本次改名的结果。"""
+    db_path = database.DATABASE_PATH
+    setup = database.get_connection()
+    try:
+        rid = service.register_name(setup, "chat", "Original", "original")["id"]
+    finally:
+        setup.close()
+
+    def racer_action(racer):
+        service.rename_name(racer, "chat", rid, "Second", 2)
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        record = service.rename_name(conn, "chat", rid, "First", 1)
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert record["id"] == rid
+    assert record["original_name"] == "First"
+    assert record["normalized_name"] == "first"
+    assert record["namespace"] == "chat"
+    assert record["revision"] == 2
+
+    rows = client.get("/namespaces/chat/names").json()
+    assert [(r["original_name"], r["revision"]) for r in rows] == [("Second", 3)]
+
+
+def test_swap_response_keeps_request_order_under_immediate_rename(client):
+    """交换：COMMIT 后其中一条立即被改名，响应仍按请求顺序给出交换后记录。"""
+    db_path = database.DATABASE_PATH
+    setup = database.get_connection()
+    try:
+        left = service.register_name(setup, "chat", "Alpha", "alpha")
+        right = service.register_name(setup, "chat", "Beta", "beta")
+        left_id, right_id = left["id"], right["id"]
+    finally:
+        setup.close()
+
+    def racer_action(racer):
+        # 交换提交后 left_id 持有 "beta"，立即将其改名
+        service.rename_name(racer, "chat", left_id, "Taken", 2)
+
+    # 请求顺序故意传成 [right_id, left_id]，验证响应按请求顺序而非 id 排序
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        records = service.swap_names(
+            conn, "chat", [(right_id, 1), (left_id, 1)]
+        )
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert [r["id"] for r in records] == [right_id, left_id]
+    assert records[0]["original_name"] == "Alpha"
+    assert records[0]["normalized_name"] == "alpha"
+    assert records[0]["revision"] == 2
+    assert records[1]["original_name"] == "Beta"
+    assert records[1]["normalized_name"] == "beta"
+    assert records[1]["revision"] == 2
+
+    rows = {r["id"]: r for r in client.get("/namespaces/chat/names").json()}
+    assert rows[left_id]["original_name"] == "Taken"
+    assert rows[right_id]["original_name"] == "Alpha"
+
+
+def test_allocate_response_keeps_client_ids_and_candidate_indices_after_rename(client):
+    """候选分配：COMMIT 后分配结果立即被改名 / 释放，响应保留请求顺序、
+    client_id、候选序号与提交时记录。"""
+    db_path = database.DATABASE_PATH
+
+    def racer_action(racer):
+        # 提交已完成：读出本次分配的两行（按 id 即插入顺序），改名第一条、
+        # 释放第二条，覆盖两类“提交后立即变更”
+        rows = racer.execute(
+            "SELECT id, normalized_name FROM display_names "
+            "WHERE namespace = 'chat' ORDER BY id"
+        ).fetchall()
+        assert len(rows) == 2
+        service.rename_name(
+            racer, "chat", rows[0]["id"], f"x-{rows[0]['normalized_name']}", 1
+        )
+        service.release_name(
+            racer, "chat", rows[1]["id"], 1, cooldown_seconds=60
+        )
+
+    items = [
+        {"client_id": "client-b", "candidates": ["dup"]},
+        {"client_id": "client-a", "candidates": ["dup", "winner-a"]},
+    ]
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        result = service.allocate_names(conn, "chat", items)
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert result["namespace"] == "chat"
+    assert result["states_explored"] >= 1
+    assert len(result["items"]) == 2
+    first, second = result["items"]
+    # 请求顺序与 client_id 固定
+    assert first["index"] == 0
+    assert first["client_id"] == "client-b"
+    assert second["index"] == 1
+    assert second["client_id"] == "client-a"
+    # 字典序最小解为 [0, 1]：client-b 取首候选 dup，client-a 退到 winner-a。
+    # 两项均为提交时的 revision 1，与 racer 随后的改名 / 释放无关
+    assert first["candidate_index"] == 0
+    assert first["original_name"] == "dup"
+    assert first["revision"] == 1
+    assert second["candidate_index"] == 1
+    assert second["original_name"] == "winner-a"
+    assert second["revision"] == 1
+
+    names = client.get("/namespaces/chat/names").json()
+    # racer 把第一条（dup）改名、把第二条（winner-a）释放为冷却
+    assert [n["original_name"] for n in names] == ["x-dup"]
+    cooldowns = client.get("/namespaces/chat/cooldowns").json()
+    assert [c["normalized_name"] for c in cooldowns] == ["winner-a"]
+
+
+def test_reservation_response_is_frozen_when_merged_immediately(client):
+    """预占：COMMIT 后预占立即随命名空间合并迁走，响应仍保留原空间与 token。"""
+    db_path = database.DATABASE_PATH
+
+    def racer_action(racer):
+        service.merge_namespaces(racer, "chat", "vault")
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        record = service.create_reservation(conn, "chat", "Reserve-me", 120)
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert record["namespace"] == "chat"
+    assert record["original_name"] == "Reserve-me"
+    assert record["normalized_name"] == "reserve-me"
+    assert isinstance(record["token"], str) and record["token"]
+    assert record["ttl_seconds"] == 120
+    assert record["expires_at"].endswith("Z")
+
+
+def test_release_response_is_frozen_when_cooldown_purged_or_merged_after_commit(client):
+    """释放：COMMIT 后冷却记录立刻随合并迁走，响应保留原空间与记录数量。"""
+    db_path = database.DATABASE_PATH
+    setup = database.get_connection()
+    try:
+        rid = service.register_name(setup, "chat", "Gone", "gone")["id"]
+    finally:
+        setup.close()
+
+    def racer_action(racer):
+        service.merge_namespaces(racer, "chat", "bin")
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        record = service.release_name(conn, "chat", rid, 1, cooldown_seconds=3600)
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert record["namespace"] == "chat"
+    assert record["original_name"] == "Gone"
+    assert record["normalized_name"] == "gone"
+    assert record["cooldown_seconds"] == 3600
+    assert record["expires_at"].endswith("Z")
+    # 源空间冷却已随合并迁走，但响应没有缺项
+    assert client.get("/namespaces/chat/cooldowns").json() == []
+    binned = client.get("/namespaces/bin/cooldowns").json()
+    assert [c["original_name"] for c in binned] == ["Gone"]
+
+
+def test_script_policy_response_is_frozen_when_replaced_immediately(client):
+    """策略 PUT：COMMIT 后策略立即被另一连接更新，响应固定为本次提交的 revision。"""
+    db_path = database.DATABASE_PATH
+
+    def racer_action(racer):
+        service.put_script_policy(
+            racer, "chat", [("Latin", "Cyrillic")], expected_revision=1
+        )
+
+    conn, racer, reader = _blocking_commit_window(db_path, racer_action)
+    try:
+        record = service.put_script_policy(
+            conn, "chat", [("Greek", "Latin")], expected_revision=0
+        )
+    finally:
+        conn.close(); racer.close(); reader.close()
+
+    assert record["namespace"] == "chat"
+    assert record["revision"] == 1
+    assert sorted(tuple(p) for p in record["blocked_script_pairs"]) == [
+        ("Greek", "Latin")
+    ]
+
+    current = client.get("/namespaces/chat/script-policy").json()
+    assert current["revision"] == 2
+
+
+def test_commit_failure_rolls_back_business_rows_and_audit_events(client):
+    """COMMIT 本身失败（另一连接的读事务持续持有共享锁致 SQLITE_BUSY）：
+    沿用原错误处理抛 NameConflictError，业务写入与审计事件一起回滚，
+    不返回成功，也不为补齐响应重复写入。"""
+    db_path = database.DATABASE_PATH
+
+    # busy_timeout=0：reader 不释放共享锁时 COMMIT 立即 SQLITE_BUSY
+    conn = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 0")
+    reader = sqlite3.connect(db_path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT count(*) FROM display_names").fetchone()
+    try:
+        with pytest.raises(service.NameConflictError):
+            service.register_name(conn, "chat", "Never", "never")
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+        conn.close()
+
+    # 业务行未写入
+    assert client.get("/namespaces/chat/names").json() == []
+    # 审计事件与业务写入同生共死：没有孤儿 insert 事件
+    events = client.get("/name-events").json()["events"]
+    assert events == []
